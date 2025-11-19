@@ -9,7 +9,7 @@ import cv2
 import time
 
 app = FastAPI()
-model = YOLO(r"C:\Users\ashli\runs\detect\train12\weights\best.pt")
+
 
 # Configure CORS
 app.add_middleware(
