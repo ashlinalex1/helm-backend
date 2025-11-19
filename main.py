@@ -1,6 +1,6 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
+
 import numpy as np
 from PIL import Image
 import io
