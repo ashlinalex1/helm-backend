@@ -1,13 +1,7 @@
 fastapi
 uvicorn
+onnxruntime
 opencv-python-headless
 numpy
 Pillow
 python-multipart
-requests
-
-# FORCE CPU-only torch!
-torch==2.2.0+cpu -f https://download.pytorch.org/whl/cpu
-
-# ultralytics WITHOUT triggering CUDA
-ultralytics==8.0.227

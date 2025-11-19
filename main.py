@@ -1,21 +1,28 @@
 from fastapi import FastAPI, File, UploadFile, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from ultralytics import YOLO
 import numpy as np
 from PIL import Image
 import io
 import base64
 import cv2
+import onnxruntime as ort
 import time
 
 app = FastAPI()
 
+# ------------------ Load ONNX Models ------------------
+helmet_session = ort.InferenceSession("best1.onnx", providers=["CPUExecutionProvider"])
+seatbelt_session = ort.InferenceSession("best2.onnx", providers=["CPUExecutionProvider"])
 
-# Configure CORS
+# Get model input name
+helmet_input_name = helmet_session.get_inputs()[0].name
+seatbelt_input_name = seatbelt_session.get_inputs()[0].name
+
+# ------------------ CORS ------------------
 app.add_middleware(
     CORSMiddleware,
     allow_origins=[
-        "http://localhost:3000", 
+        "http://localhost:3000",
         "http://127.0.0.1:3000",
         "http://localhost:8080",
         "http://127.0.0.1:8080"
@@ -25,39 +32,39 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# ------------------ Helper Functions ------------------
+def preprocess(img):
+    img_resized = cv2.resize(img, (640, 640))
+    img_rgb = cv2.cvtColor(img_resized, cv2.COLOR_BGR2RGB)
+    img_normalized = img_rgb.astype(np.float32) / 255.0
+    img_transposed = np.transpose(img_normalized, (2, 0, 1))
+    img_input = np.expand_dims(img_transposed, axis=0)
+    return img_input
 
-def process_image(image_data: bytes):
-    """Helper function to process image and return detections"""
-    # Convert bytes -> PIL -> NumPy RGB
-    image = Image.open(io.BytesIO(image_data)).convert("RGB")
-    img_array = np.array(image)  # shape H x W x 3
-    
-    # Run YOLO
-    results = model.predict(source=img_array, conf=0.25, imgsz=640, verbose=False)
-    
-    detections = []
-    if results and results[0].boxes is not None:
-        for box in results[0].boxes:
-            cls_id = int(box.cls.item())
-            conf = float(box.conf.item())
-            label = model.names.get(cls_id, f"class_{cls_id}")
-            x1, y1, x2, y2 = map(int, box.xyxy[0])
-            detections.append({
-                "label": label,
-                "confidence": conf,
-                "x": x1,
-                "y": y1,
-                "width": x2 - x1,
-                "height": y2 - y1
-            })
-    
-    return img_array, detections
+def postprocess(outputs, img_shape):
+    boxes = []
+    output = outputs[0]
+
+    for det in output:
+        x1, y1, x2, y2, conf, cls = det
+        if conf < 0.25:
+            continue
+
+        boxes.append({
+            "label": str(int(cls)),
+            "confidence": float(conf),
+            "x": int(x1),
+            "y": int(y1),
+            "width": int(x2 - x1),
+            "height": int(y2 - y1)
+        })
+
+    return boxes
 
 def draw_boxes(image: np.ndarray, detections: list):
-    """Draw bounding boxes on the image"""
     img_with_boxes = image.copy()
     for det in detections:
-        color = (0, 255, 0) if "helmet" in det["label"].lower() else (0, 0, 255)
+        color = (0, 255, 0) if det["label"] == "helmet" else (0, 0, 255)
         cv2.rectangle(
             img_with_boxes,
             (det["x"], det["y"]),
@@ -65,7 +72,6 @@ def draw_boxes(image: np.ndarray, detections: list):
             color,
             2
         )
-        # Add label and confidence
         label = f"{det['label']} {det['confidence']*100:.1f}%"
         cv2.putText(
             img_with_boxes,
@@ -78,219 +84,77 @@ def draw_boxes(image: np.ndarray, detections: list):
         )
     return img_with_boxes
 
-# Load both models once (on startup)
-helmet_model = YOLO("best1.pt")
-seatbelt_model = YOLO("best2.pt")
-
-
+# ------------------ Predict Endpoint ------------------
 @app.post("/predict")
 async def predict_upload(file: UploadFile = File(...)):
-    """Endpoint for file uploads (Helmet + Seatbelt detection)"""
     try:
-        # Read uploaded file into OpenCV image
         image_data = await file.read()
         np_arr = np.frombuffer(image_data, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
         detections = []
 
-        # ---------------- Helmet Model ----------------
-        helmet_results = helmet_model(frame)
+        # ------------- HELMET MODEL -------------
+        helmet_input = preprocess(frame)
+        helmet_outputs = helmet_session.run(None, {helmet_input_name: helmet_input})
+        helmet_boxes = postprocess(helmet_outputs, frame.shape)
+        detections.extend(helmet_boxes)
 
-        # Get annotated image directly from YOLO
-        annotated = helmet_results[0].plot()
+        # Draw helmet detections
+        annotated = frame.copy()
 
-        if helmet_results[0].boxes is not None:
-            for box in helmet_results[0].boxes:
-                cls_id = int(box.cls.item())
-                conf = float(box.conf.item())
-                label = helmet_model.names.get(cls_id, f"class_{cls_id}")
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                detections.append({
-                    "label": label,
-                    "confidence": conf,
-                    "x": x1, "y": y1,
-                    "width": x2 - x1,
-                    "height": y2 - y1
-                })
+        # ------------- SEATBELT MODEL -------------
+        seatbelt_input = preprocess(frame)
+        seatbelt_outputs = seatbelt_session.run(None, {seatbelt_input_name: seatbelt_input})
+        seatbelt_boxes = postprocess(seatbelt_outputs, frame.shape)
+        detections.extend(seatbelt_boxes)
 
-        # ---------------- Seatbelt Model ----------------
-        seatbelt_results = seatbelt_model(frame)
+        # Draw seatbelt detections
+        annotated = draw_boxes(annotated, detections)
 
-        # Overlay seatbelt detections on top of helmet annotated image
-        seatbelt_annotated = seatbelt_results[0].plot()
-        # Blend the two annotated outputs (simple max for visibility)
-        annotated = np.maximum(annotated, seatbelt_annotated)
-
-        if seatbelt_results[0].boxes is not None:
-            for box in seatbelt_results[0].boxes:
-                cls_id = int(box.cls.item())
-                conf = float(box.conf.item())
-                label = seatbelt_model.names.get(cls_id, f"class_{cls_id}")
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                detections.append({
-                    "label": label,
-                    "confidence": conf,
-                    "x": x1, "y": y1,
-                    "width": x2 - x1,
-                    "height": y2 - y1
-                })
-
-        # Encode final annotated image to base64
+        # Encode image
         _, buffer = cv2.imencode(".png", annotated)
         img_str = base64.b64encode(buffer).decode("utf-8")
 
         return {
             "success": True,
-            "image": img_str,   # annotated frame with both models
+            "image": img_str,
             "detections": detections
         }
 
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
-# @app.post("/predict")
-# async def predict_upload(file: UploadFile = File(...)):
-#     """Endpoint for file uploads (Helmet + Seatbelt detection)"""
-#     try:
-#         # Read uploaded file into OpenCV image
-#         image_data = await file.read()
-#         np_arr = np.frombuffer(image_data, np.uint8)
-#         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-#         detections = []
-
-#         # Run helmet model
-#         helmet_results = helmet_model(frame)
-#         annotated = helmet_results[0].plot()  # start with helmet annotations
-
-#         if helmet_results[0].boxes is not None and len(helmet_results[0].boxes) > 0:
-#             for box in helmet_results[0].boxes:
-#                 cls_id = int(box.cls.item())
-#                 conf = float(box.conf.item())
-#                 label = helmet_model.names.get(cls_id, f"class_{cls_id}")
-#                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-#                 detections.append({
-#                     "label": label,
-#                     "confidence": conf,
-#                     "x": x1, "y": y1,
-#                     "width": x2 - x1,
-#                     "height": y2 - y1
-#                 })
-
-#         # Run seatbelt model
-#         seatbelt_results = seatbelt_model(frame)
-#         annotated = seatbelt_results[0].plot(annotated)  # overlay on helmet annotations
-
-#         if seatbelt_results[0].boxes is not None and len(seatbelt_results[0].boxes) > 0:
-#             for box in seatbelt_results[0].boxes:
-#                 cls_id = int(box.cls.item())
-#                 conf = float(box.conf.item())
-#                 label = seatbelt_model.names.get(cls_id, f"class_{cls_id}")
-#                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-#                 detections.append({
-#                     "label": label,
-#                     "confidence": conf,
-#                     "x": x1, "y": y1,
-#                     "width": x2 - x1,
-#                     "height": y2 - y1
-#                 })
-
-#         # Encode annotated image to base64
-#         _, buffer = cv2.imencode(".png", annotated)
-#         img_str = base64.b64encode(buffer).decode("utf-8")
-
-#         return {
-#             "success": True,
-#             "image": img_str,   # annotated frame
-#             "detections": detections
-#         }
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-# @app.post("/predict")
-# async def predict_upload(file: UploadFile = File(...)):
-#     """Endpoint for file uploads (used by UploadSection)"""
-#     try:
-#         # Read file bytes and decode into OpenCV image
-#         image_data = await file.read()
-#         np_arr = np.frombuffer(image_data, np.uint8)
-#         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
-
-#         # Run YOLO on uploaded image
-#         results = model(frame)
-
-#         # Get annotated image directly from YOLO
-#         annotated = results[0].plot()
-
-#         # Encode annotated image to base64
-#         _, buffer = cv2.imencode('.png', annotated)
-#         img_str = base64.b64encode(buffer).decode("utf-8")
-
-#         # Extract detections
-#         detections = []
-#         if results and results[0].boxes is not None:
-#             for box in results[0].boxes:
-#                 cls_id = int(box.cls.item())
-#                 conf = float(box.conf.item())
-#                 label = model.names.get(cls_id, f"class_{cls_id}")
-#                 x1, y1, x2, y2 = map(int, box.xyxy[0])
-#                 detections.append({
-#                     "label": label,
-#                     "confidence": conf,
-#                     "x": x1,
-#                     "y": y1,
-#                     "width": x2 - x1,
-#                     "height": y2 - y1
-#                 })
-
-#         return {
-#             "success": True,
-#             "image": img_str,   # annotated frame
-#             "detections": detections
-#         }
-
-#     except Exception as e:
-#         raise HTTPException(status_code=500, detail=str(e))
-
-
+# ------------------ Webcam Endpoint ------------------
 @app.post("/predict-webcam")
 async def predict_webcam(file: bytes = File(...)):
-    """Endpoint for webcam frames (used by WebcamSection)"""
     try:
-        # Convert bytes -> NumPy BGR image (OpenCV format)
         np_arr = np.frombuffer(file, np.uint8)
         frame = cv2.imdecode(np_arr, cv2.IMREAD_COLOR)
 
-        # Run YOLO directly on frame
-        results = model(frame)
+        detections = []
 
-        # Use YOLO's built-in plotting
-        annotated = results[0].plot()
+        helmet_input = preprocess(frame)
+        seatbelt_input = preprocess(frame)
 
-        # Encode annotated frame to base64
+        # Helmet
+        helmet_outputs = helmet_session.run(None, {helmet_input_name: helmet_input})
+        helmet_boxes = postprocess(helmet_outputs, frame.shape)
+        detections.extend(helmet_boxes)
+
+        # Seatbelt
+        seatbelt_outputs = seatbelt_session.run(None, {seatbelt_input_name: seatbelt_input})
+        seatbelt_boxes = postprocess(seatbelt_outputs, frame.shape)
+        detections.extend(seatbelt_boxes)
+
+        annotated = draw_boxes(frame, detections)
+
         _, buffer = cv2.imencode('.png', annotated)
         img_str = base64.b64encode(buffer).decode("utf-8")
 
-        # Collect detections from YOLO
-        detections = []
-        if results and results[0].boxes is not None:
-            for box in results[0].boxes:
-                cls_id = int(box.cls.item())
-                conf = float(box.conf.item())
-                label = model.names.get(cls_id, f"class_{cls_id}")
-                x1, y1, x2, y2 = map(int, box.xyxy[0])
-                detections.append({
-                    "label": label,
-                    "confidence": conf,
-                    "x": x1,
-                    "y": y1,
-                    "width": x2 - x1,
-                    "height": y2 - y1
-                })
-
         return {
             "success": True,
-            "image": img_str,   # annotated frame from YOLO.plot()
+            "image": img_str,
             "detections": detections
         }
 
